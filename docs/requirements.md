@@ -2,12 +2,12 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | v1.1（一期） |
+| 版本 | v1.2（一期） |
 | 日期 | 2026-09-14 |
 | 状态 | 待评审 |
 | 命名 | 暂定"离线语音指令助手"，代号后定 |
 
-> **修订记录**：v1.0 初稿；v1.1 将动作执行层由"HTTP 动作执行"重构为"工厂模式 ActionHandler 架构"，HTTP 成为其中第一个 Handler 实现。
+> **修订记录**：v1.0 初稿；v1.1 将动作执行层由"HTTP 动作执行"重构为"工厂模式 ActionHandler 架构"，HTTP 成为其中第一个 Handler 实现；v1.2 动作配置从指令中抽离为独立 `actions.yaml`（指令按 id 引用），`type` 之后的动作字段结构完全由 Handler 自治。
 
 ---
 
@@ -45,9 +45,9 @@
 | 前端语音输入 | 浏览器麦克风采集：点击开始，静音自动停，手动停止兜底 |
 | 后端识别 | 一体化接口：接收音频 → 离线 ASR → 文本归一化 → 意图匹配 → 经 ActionHandler 工厂执行动作 → 返回结果 |
 | 意图匹配 | 两级匹配引擎（规则槽位 → 句向量相似度），阈值可配 |
-| 动作执行 | 工厂模式 ActionHandler：按 `action.type` 分发，一期内置 HttpActionHandler |
+| 动作执行 | 工厂模式 ActionHandler：按动作 `type` 分发，一期内置 HttpActionHandler |
 | 未命中处理 | 前端展示识别文本 + Top3 候选指令，一键点击执行 |
-| 指令管理 | 前端增删改查指令（示例说法、正则规则、HTTP 动作），写回 YAML 并热加载 |
+| 指令/动作管理 | 前端分别增删改查指令（说法、规则、动作引用）与动作（type + Handler 自有字段），写回 YAML 并热加载 |
 | 匹配测试面板 | 输入一句话文本，免语音直接查看命中结果与得分 |
 | 执行历史 | 每次调用的全链路记录（时间、识别文本、命中、置信度、执行结果、耗时） |
 | 系统设置 | 相似度阈值、静音时长、HTTP 超时等参数可视化调整 |
@@ -83,7 +83,7 @@
 │     ├ 第一级：规则槽位（各指令的 regex，配置顺序=优先级）                │
 │     └ 第二级：句向量相似度（DJL+ONNX bge-small-zh，仅无参数指令）       │
 │  ⑤ 动作执行器（ActionHandler 工厂按 type 分发，一期内置 HTTP Handler）│
-│  ⑥ 配置管理（YAML 读写 + 文件监听热加载） / 日志                        │
+│  ⑥ 配置管理（commands/actions/settings YAML 读写 + 热加载） / 日志      │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 ▼
                      用户配置的目标系统（智能家居网关等）
@@ -100,7 +100,8 @@
 | D3 | 配置文件为唯一事实源，前端管理页修改由后端写回文件 | 一期不做数据库，保持简单；热加载让改动即时生效 |
 | D4 | 一体化接口 `/api/voice/command` + 独立文本匹配接口 `/api/match/text` | 前者主流程一次调用；后者服务测试面板，免语音调试匹配引擎 |
 | D5 | 后端托管前端构建产物，单进程部署 | 一个 jar + 一个配置文件 + 模型目录即可运行，符合跨平台目标 |
-| D6 | 动作执行层采用工厂模式：`ActionHandler` 接口 + 工厂按 `action.type` 分发 | 新增动作类型（本地命令、模拟按键等）只需新增 Handler 实现类，匹配引擎、接口协议零改动 |
+| D6 | 动作执行层采用工厂模式：`ActionHandler` 接口 + 工厂按 `actions[].type` 分发 | 新增动作类型（本地命令、模拟按键等）只需新增 Handler 实现类，匹配引擎、接口协议零改动 |
+| D7 | 动作配置从指令中抽离（独立 `actions.yaml`，指令以动作 id 引用）；`type` 之后的字段由 Handler 自定义并自行校验 | 动作可复用；指令管"听懂"、动作管"执行"；引擎对动作字段结构零假设（不透明透传） |
 
 ### 3.3 重要环境约束（必须写进部署说明）
 
@@ -144,7 +145,7 @@
     "slots": { "value": "26", "mode": "set" }
   },
   "candidates": [ { "command_id": "ac_on", "name": "打开空调", "score": 0.71 } ],
-  "action": { "ok": true, "handler": "http", "status": 200, "elapsed_ms": 120, "summary": "{...响应摘要...}" },
+  "action": { "ok": true, "action_id": "ha_climate_set_temp", "handler": "http", "status": 200, "elapsed_ms": 120, "summary": "{...响应摘要...}" },
   "elapsed_ms": 890
 }
 ```
@@ -187,10 +188,10 @@
 
 **启动校验（配置加载时）**
 
-- 只配了 `phrases` 而槽位出现在 action 模板中 → 报错拒绝加载；
+- 只配了 `phrases` 而其引用动作中的 `${槽位}` 占位符需要参数 → 报错拒绝加载；
 - `patterns` 正则语法错误 → 报错并指出行号；
-- 指令 id 重复 → 报错；
-- `action.type` 无对应已注册 Handler → 报错拒绝加载（详见 FR-6）。
+- 指令 id / 动作 id 重复 → 报错；
+- 指令引用的动作 id 不存在、动作 `type` 无对应已注册 Handler → 报错（详见 FR-6）。
 
 **验收（对应用户原始诉求）**：
 - "打开空调 / 开空调 / 空调开启 / 帮我把空调打开" → 均命中 `ac_on`（相似度路径）；
@@ -212,38 +213,47 @@
 **架构**：
 
 ```
-ActionHandler（接口）
- ├─ String type()                          // 动作类型标识，对应配置 action.type
- ├─ ValidationResult validate(ActionDef)  // 配置加载时校验动作定义合法性
+ActionHandler（接口）—— 动作配置结构由各 Handler 自治
+ ├─ String type()                          // 动作类型标识，对应 actions[].type
+ ├─ ValidationResult validate(ActionDef)  // 校验本类型自有字段（如 url 合法性）
  └─ ActionResult execute(ActionDef, slots, ctx)
 
 ActionHandlerFactory
  └─ type → Handler 注册表；Spring 容器自动收集所有实现类完成注册
 ```
 
-- 意图命中后，工厂按指令 `action.type` 取对应 Handler 执行；**匹配引擎不感知具体动作类型**；
-- **一期唯一内置实现：`HttpActionHandler`（type = http）**，行为定义：
-  - 动作定义：`method` / `url` / `headers` / `body`；
-  - 槽位参数以 `${value}`、`${mode}`、`${step}` 等占位符透传到 url、headers、body 任意位置；
+- 动作定义独立存放于 `config/actions.yaml`，指令以 `action: <动作id>` 引用（见第 5 节），同一动作可被多条指令复用；
+- **`type` 之后的动作字段完全由对应 Handler 自行定义、解析、校验与执行**，引擎不做任何结构假设，作为不透明配置整体透传；
+- 平台级约定仅两条，对所有 Handler 生效：
+  1. `type` 分发：工厂按动作定义的 type 路由到 Handler；
+  2. `${槽位名}` 占位符：引擎在分发前对动作配置做通用递归字符串替换，Handler 拿到已替换配置 + 原始 slots（Handler 也可不用占位符，直接读取 slots 自行组装）；
+- **一期唯一内置实现：`HttpActionHandler`（type = http）**，自有字段与行为：
+  - 字段：`method` / `url` / `headers` / `body`，占位符可出现在任意字段任意位置；
   - 默认超时 10 秒（可配），超时或连接失败返回明确错误，**不自动重试**；
   - 响应体只保留摘要（前 500 字符）用于前端展示与日志；
-- 配置校验：`action.type` 未注册时加载即报错并指出指令 id（FR-4 启动校验项之一）；
-- **扩展约定**：新增动作类型 = 新增一个 Handler 实现类（如二期 `local_command`、`keystroke`），引擎、工厂、接口协议零改动；前端动作编辑器按 type 动态渲染对应表单。
+- 配置校验（FR-4 启动校验项）：
+  - 动作 `type` 未注册 → 报错并指出动作 id；
+  - 指令引用的动作 id 不存在 → 报错并指出指令 id；
+  - 动作占位符 `${xxx}` 未被引用它的任何指令 patterns 提供 → 报错（引擎级通用检查，不感知字段结构，仅扫描字符串）；
+- **扩展约定**：新增动作类型 = 新增一个 Handler 实现类（如二期 `local_command`、`keystroke`），引擎、工厂、接口协议零改动；前端动作编辑器按 type 动态渲染该 Handler 的自有字段表单。
 
 **验收**：
 - 温度指令的 26 成功替换进请求体发出（可用 httpbin 类服务验证）；
-- 配置一个 `type: xxx`（未注册）的动作，配置加载报错且指出所在指令；
-- 追加一个仅打日志的 `log` Handler（不发布到前端下拉，供调试与扩展性验证），不改引擎代码即可被 `type: log` 调用。
+- 同一动作被两条指令引用，均能正确执行；
+- 配置 `type: xxx`（未注册）报错并指出动作 id；指令引用不存在的动作 id 报错并指出指令 id；
+- 追加一个仅打日志的 `log` Handler（不发布到前端下拉，供调试与扩展性验证），引擎不解析其字段结构、不改引擎代码即可被 `type: log` 调用。
 
-### FR-7 指令配置管理（前端 + 后端）
+### FR-7 指令与动作配置管理（前端 + 后端）
 
-- 前端指令管理页：列表（启用状态、短语数、规则数）、新增、编辑、删除、启用/停用；
-- 编辑项：基础信息（id、名称）、示例说法（多条，可增删）、参数规则（正则 + 槽位映射）、动作配置（动作类型下拉选择 + 按 `type` 动态渲染表单，一期仅 http：method/url/headers/body，带模板变量插入按钮）；
-- 后端提供 CRUD 接口，**每次修改写回 YAML 并触发热加载**；
+- 前端两个管理页：
+  - **指令管理**：列表（启用状态、短语数、规则数、引用动作）、新增、编辑、删除、启用/停用；编辑项：基础信息（id、名称）、动作引用（下拉选择已有动作）、示例说法（多条，可增删）、参数规则（正则 + 槽位映射）；
+  - **动作管理**：列表（id、类型）、新增、编辑、删除；编辑项：基础信息（id、名称）、动作类型下拉选择（一期仅 http）+ 按 `type` 动态渲染该 Handler 的自有字段表单（http：method/url/headers/body，带模板变量插入按钮）；
+- 删除动作前检查引用：仍被指令引用则拒绝并提示引用方；
+- 后端提供指令与动作两组 CRUD 接口，**每次修改分别写回对应 YAML 并触发热加载**；
 - 同时保留直接手改文件的能力：文件监听（轮询 mtime 即可）发现变化 ≤3 秒热加载；
 - 加载失败（校验不通过）时：保留上一份有效配置继续运行，前端全局告警显示错误详情。
 
-**验收**：前端新增一条指令后 ≤3 秒内语音即可命中；手改文件同样生效；写坏正则时系统不崩且告警。
+**验收**：前端新增一条引用已有动作的指令后 ≤3 秒内语音即可命中；动作删除的引用保护生效；手改文件同样生效；写坏正则时系统不崩且告警。
 
 ### FR-8 匹配测试面板（前端）
 
@@ -276,7 +286,7 @@ ActionHandlerFactory
 
 ## 5. 配置文件设计
 
-文件：`config/commands.yaml`（指令）+ `config/settings.yaml`（系统参数）。示例：
+文件：`config/commands.yaml`（指令）+ `config/actions.yaml`（动作）+ `config/settings.yaml`（系统参数）。**指令与动作解耦**：指令只描述"怎么听懂"，动作只描述"怎么执行"，指令通过动作 id 引用，同一动作可复用。
 
 ```yaml
 # config/settings.yaml
@@ -286,31 +296,46 @@ settings:
   audio:
     silence_ms: 1000          # 前端静音自动停时长（接口下发给前端）
   action:
-    http_timeout_ms: 10000
+    http_timeout_ms: 10000    # http Handler 专属参数
 ```
 
 ```yaml
-# config/commands.yaml
+# config/actions.yaml —— 动作定义；type 之后的字段由对应 Handler 自定义
+actions:
+  - id: ha_climate_on                     # 动作唯一 id，供指令引用
+    name: 打开空调                         # 展示名（可选）
+    type: http                            # 动作类型 → 工厂分发到 HttpActionHandler
+    method: POST                          # ↓ 以下均为 http Handler 的自有字段
+    url: http://192.168.1.10:8123/api/services/climate/turn_on
+    headers:
+      Authorization: "Bearer xxx"
+    body: '{"entity_id": "climate.ac"}'
+
+  - id: ha_climate_set_temp
+    name: 设置空调温度
+    type: http
+    method: POST
+    url: http://192.168.1.10:8123/api/services/climate/set_temperature
+    body: '{"entity_id":"climate.ac","temperature":"${value}","mode":"${mode}","step":"${step}"}'
+```
+
+```yaml
+# config/commands.yaml —— 指令定义，动作以 id 引用
 commands:
   - id: ac_on                          # 唯一 id
     name: 打开空调                      # 展示名
     enabled: true
+    action: ha_climate_on               # 引用 actions.yaml 中的动作 id
     phrases:                           # 相似说法示例（向量匹配用，无参数指令）
       - 打开空调
       - 开空调
       - 空调开启
       - 帮我把空调打开
-    action:
-      type: http                        # 动作类型 → 工厂分发到对应 ActionHandler
-      method: POST
-      url: http://192.168.1.10:8123/api/services/climate/turn_on
-      headers:
-        Authorization: "Bearer xxx"
-      body: '{"entity_id": "climate.ac"}'
 
   - id: ac_temp                        # 参数类指令：必须且只能走 patterns
     name: 空调温度调节
     enabled: true
+    action: ha_climate_set_temp
     patterns:
       - regex: '温度.*?(设|调)到?(?P<value>\d+)\s*度'
         slots: { mode: set }
@@ -318,26 +343,29 @@ commands:
         slots: { mode: up, step: 1 }
       - regex: '(调低|降低|低一点|太?热)'
         slots: { mode: down, step: 1 }
-    action:
-      type: http
-      method: POST
-      url: http://192.168.1.10:8123/api/services/climate/set_temperature
-      body: '{"entity_id":"climate.ac","temperature":"${value}","mode":"${mode}","step":"${step}"}'
 ```
 
-字段说明：
+指令字段说明：
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `id` | 是 | 全局唯一，稳定标识 |
 | `name` | 是 | 展示名 |
 | `enabled` | 否 | 默认 true，停用后不参与匹配 |
+| `action` | 是 | 引用的动作 id（定义在 actions.yaml） |
 | `phrases` | 无参数指令必填 | 相似度匹配的示例说法，建议 ≥3 条且覆盖不同语序 |
 | `patterns` | 参数指令必填 | 规则列表，按序匹配；`regex` 支持命名捕获组，`slots` 为固定键值 |
-| `action` | 是 | 动作定义，支持 `${槽位名}` 模板变量 |
-| `action.type` | 是 | 动作类型，工厂据此分发到对应 ActionHandler；一期仅 `http` |
 
-约束（加载时校验，见 FR-4）：`phrases` 与 `patterns` 至少其一；action 模板引用的槽位必须能被 patterns 提供。
+动作字段说明：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | 是 | 动作唯一 id，被指令引用；删除前须无指令引用 |
+| `name` | 否 | 展示名 |
+| `type` | 是 | 动作类型，工厂据此分发到对应 ActionHandler；一期仅 `http` |
+| （其余字段） | 由 Handler 决定 | `type` 之后完全由 Handler 自行定义与校验，引擎不解析、透传执行；`${槽位名}` 占位符为平台级通用约定 |
+
+约束（加载时校验，见 FR-4）：`phrases` 与 `patterns` 至少其一；指令引用的动作 id 必须存在；动作中的 `${槽位}` 占位符必须能被所有引用它的指令 patterns 提供。
 
 ---
 
@@ -351,6 +379,10 @@ commands:
 | POST | `/api/commands` | 新增（写回 YAML 并热加载） |
 | PUT | `/api/commands/{id}` | 修改 |
 | DELETE | `/api/commands/{id}` | 删除 |
+| GET | `/api/actions` | 动作列表（含 type 与 Handler 自有字段） |
+| POST | `/api/actions` | 新增动作（写回 actions.yaml 并热加载） |
+| PUT | `/api/actions/{id}` | 修改动作 |
+| DELETE | `/api/actions/{id}` | 删除动作（仍被指令引用时返回 409） |
 | GET / PUT | `/api/settings` | 读取/修改系统设置 |
 | GET | `/api/logs?limit=50&filter=` | 执行历史 |
 | GET | `/api/health` | 健康检查（含模型加载状态） |
@@ -443,4 +475,5 @@ commands:
 | 10 | 前端框架 | Vue 3 + Element Plus | 默认采纳（可改） |
 | 11 | 指令建模 | 扁平指令列表，不做设备×动作组合 | 默认采纳（可改） |
 | 12 | 参数槽位 | 数字 / 方向(set·up·down) / 幅度(step) | 默认采纳（可改） |
-| 13 | 动作执行架构 | 工厂模式 ActionHandler，按 `action.type` 分发；一期仅内置 HttpActionHandler | 用户确认（v1.1） |
+| 13 | 动作执行架构 | 工厂模式 ActionHandler，按动作 `type` 分发；一期仅内置 HttpActionHandler | 用户确认（v1.1） |
+| 14 | 动作配置组织 | 独立 `actions.yaml`，指令按动作 id 引用、可复用；`type` 后字段由 Handler 自定义与校验，引擎透传 | 用户确认（v1.2） |
