@@ -1,0 +1,7 @@
+target/
+libs/
+models/
+audio/
+*.wav
+*.zip
+out/
