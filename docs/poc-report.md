@@ -4,7 +4,7 @@
 |---|---|
 | 版本 | v1.1（增补 Vosk 方案验证与 ASR 选型切换） |
 | 日期 | 2026-09-15 |
-| 关联 | `docs/requirements.md` v1.3（一期） |
+| 关联 | `docs/requirements.md` v2.0（一期·最小实现；v2.0 匹配方案已改为关键词权重、ASR 定为 Vosk 小模型，本文句向量与模型对照数据保留为备选参考） |
 | 结论 | **通过。ASR 选型定为 Vosk + vosk-model-cn-0.22 大模型（实测 10/10、同音错字 0 例、规则+相似度匹配全 PASS）**；句向量 bge-small-zh-v1.5 不变；sherpa-onnx/SenseVoice 验证数据保留为备选方案参考 |
 
 ## 1. 验证目标与方法
